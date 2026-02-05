@@ -1,6 +1,8 @@
 import os
 import re
+import time
 import sqlite3
+import asyncio
 from io import BytesIO
 from threading import Thread
 
@@ -30,6 +32,7 @@ Thread(target=run_web, daemon=True).start()
 # =========================
 DB_PATH = "data.db"
 
+# حطهم في Render Environment Variables
 PANEL_CHANNEL_ID = int(os.getenv("PANEL_CHANNEL_ID", "0") or "0")
 PANEL_MESSAGE_ID = int(os.getenv("PANEL_MESSAGE_ID", "0") or "0")
 
@@ -228,6 +231,7 @@ def format_results(records):
     for n, c, uid in records:
         lines.append(f"{c or '-'} | {n} | {uid}")
         ids_only.append(uid)
+
     pretty = "```" + "\n".join(lines) + "```" if lines else "```-```"
     ids_block = "```" + "\n".join(ids_only) + "```" if ids_only else "```-```"
     return pretty, ids_block
@@ -512,11 +516,29 @@ async def prefix_bulkadd(ctx, *, data: str):
     await ctx.send(f"✅ تمت إضافة/تحديث: {ok}\n❌ سجلات فشلت: {bad}")
 
 # =========================
-# Run (simple + clear)
+# Run (anti-429 crash loop)
 # =========================
-token = os.getenv("TOKEN")
-if not token:
-    raise RuntimeError("❌ TOKEN غير موجود في Render Environment Variables")
+TOKEN = os.getenv("TOKEN")
+if not TOKEN:
+    raise RuntimeError("❌ TOKEN غير موجود في Render Environment Variables (KEY = TOKEN)")
 
-print("STARTING DISCORD BOT... (if you don't see 'Logged in as', token/429 is the issue)")
-bot.run(token, reconnect=True)
+print("STARTING DISCORD BOT...")
+
+async def runner():
+    async with bot:
+        await bot.start(TOKEN, reconnect=True)
+
+while True:
+    try:
+        asyncio.run(runner())
+    except discord.errors.HTTPException as e:
+        txt = str(e).lower()
+        if "429" in txt or "rate limited" in txt or "cloudflare" in txt or "1015" in txt:
+            print("⚠️ Discord/Cloudflare rate limit. Sleeping 20 minutes then retry...")
+            time.sleep(20 * 60)
+            continue
+        raise
+    except Exception as e:
+        print("❌ Unexpected error:", repr(e))
+        time.sleep(60)
+        continue
