@@ -1,7 +1,5 @@
 import os
 import re
-import time
-import asyncio
 import sqlite3
 from io import BytesIO
 from threading import Thread
@@ -28,26 +26,25 @@ def run_web():
 Thread(target=run_web, daemon=True).start()
 
 # =========================
-# Discord Bot
+# Settings
 # =========================
-intents = discord.Intents.default()
-intents.message_content = True
-
-bot = commands.Bot(command_prefix="!", intents=intents)
-
 DB_PATH = "data.db"
 
 PANEL_CHANNEL_ID = int(os.getenv("PANEL_CHANNEL_ID", "0") or "0")
 PANEL_MESSAGE_ID = int(os.getenv("PANEL_MESSAGE_ID", "0") or "0")
 
-# caches:
-# normalized_name -> (name, code, user_id)
-cache_name = {}
-# normalized_code -> (name, code, user_id)
-cache_code = {}
+# =========================
+# Discord Bot
+# =========================
+intents = discord.Intents.default()
+intents.message_content = True
+bot = commands.Bot(command_prefix="!", intents=intents)
+
+cache_name = {}  # normalized_name -> (name, code, user_id)
+cache_code = {}  # normalized_code -> (name, code, user_id)
 
 # =========================
-# Normalize helpers
+# Helpers
 # =========================
 def normalize_name(name: str) -> str:
     return str(name).replace("_", " ").replace("-", " ").strip().lower()
@@ -133,10 +130,10 @@ def load_cache():
         if cc:
             cache_code[cc] = rec
 
-    print(f"✅ Loaded {len(cache_name)} names and {len(cache_code)} codes into cache")
+    print(f"✅ Cache loaded: {len(cache_name)} names, {len(cache_code)} codes")
 
 # =========================
-# Core operations
+# Operations
 # =========================
 def upsert_user(name: str, code: str, user_id: str):
     nn = normalize_name(name)
@@ -202,46 +199,11 @@ def delete_all():
     conn.close()
     load_cache()
 
-def edit_one(key: str, new_name=None, new_code=None, new_user_id=None):
-    row = find_row_by_key(key)
-    if not row:
-        return False, None, None
-
-    old_name, old_code, old_uid = row
-
-    final_name = normalize_name(new_name) if new_name and str(new_name).strip() else old_name
-    final_code = normalize_code(new_code) if new_code and str(new_code).strip() else old_code
-    final_uid = str(new_user_id).strip() if new_user_id and str(new_user_id).strip() else old_uid
-
-    if not is_valid_id(final_uid):
-        raise ValueError("ID لازم يكون أرقام فقط وصحيح")
-
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute(
-        "INSERT OR REPLACE INTO users (name, code, user_id) VALUES (?, ?, ?)",
-        (final_name, final_code, final_uid)
-    )
-    if old_name != final_name:
-        c.execute("DELETE FROM users WHERE name = ?", (old_name,))
-    conn.commit()
-    conn.close()
-
-    load_cache()
-    before = (old_name, old_code, old_uid)
-    after = (final_name, final_code, final_uid)
-    return True, before, after
-
-# =========================
-# Lookup + formatting
-# =========================
 def split_query_items(query: str):
     q = str(query).strip()
-    items = []
     if not q:
-        return items
-
-    items.append(q)  # full phrase
+        return []
+    items = [q]  # full phrase
     raw = q.replace(",", " ")
     for p in raw.split():
         if p.strip():
@@ -250,24 +212,14 @@ def split_query_items(query: str):
 
 def lookup_records(query: str):
     found = []
-    seen_ids = set()
-
+    seen = set()
     for item in split_query_items(query):
         nn = normalize_name(item)
         cc = normalize_code(item)
-
-        rec = None
-        if nn in cache_name:
-            rec = cache_name[nn]
-        elif cc in cache_code:
-            rec = cache_code[cc]
-
-        if rec:
-            n, c, uid = rec
-            if uid not in seen_ids:
-                found.append(rec)
-                seen_ids.add(uid)
-
+        rec = cache_name.get(nn) or cache_code.get(cc)
+        if rec and rec[2] not in seen:
+            found.append(rec)
+            seen.add(rec[2])
     return found
 
 def format_results(records):
@@ -276,7 +228,6 @@ def format_results(records):
     for n, c, uid in records:
         lines.append(f"{c or '-'} | {n} | {uid}")
         ids_only.append(uid)
-
     pretty = "```" + "\n".join(lines) + "```" if lines else "```-```"
     ids_block = "```" + "\n".join(ids_only) + "```" if ids_only else "```-```"
     return pretty, ids_block
@@ -287,7 +238,6 @@ def list_all_records():
     c.execute("SELECT name, code, user_id FROM users ORDER BY code IS NULL, code, name")
     rows = c.fetchall()
     conn.close()
-
     out = []
     for n, code, uid in rows:
         out.append((normalize_name(n), normalize_code(code) if code else None, str(uid)))
@@ -308,14 +258,14 @@ def parse_bulk_any(text: str):
         for line in lines:
             parts = line.split()
             if len(parts) < 3:
-                continue  # تجاهل الغلط
+                continue
             user_id = parts[0]
             code = parts[-1]
             name = " ".join(parts[1:-1])
             entries.append((user_id, name, normalize_code(code)))
         return entries
 
-    # single-line: split at each ID (15+ digits)
+    # single line: split at each ID (15+ digits)
     segments = [s.strip() for s in re.split(r'(?=\d{15,})', raw) if s.strip()]
     entries = []
     for seg in segments:
@@ -342,7 +292,6 @@ def bulk_upsert(text: str):
             bad += 1
             bad_lines.append(f"(نقص بيانات) {user_id} | {name} | {code}")
             continue
-
         upsert_user(name, code, user_id)
         ok += 1
 
@@ -377,7 +326,6 @@ class AddModal(discord.ui.Modal, title="➕ إضافة (ID الاسم الكود
             msg += "\n\nأول أخطاء:\n```" + "\n".join(bad_lines[:5]) + "```"
         await interaction.response.send_message(msg, ephemeral=True)
 
-
 class DeleteModal(discord.ui.Modal, title="🗑️ حذف (اسم أو كود)"):
     data = discord.ui.TextInput(
         label="الصق الأسماء/الأكواد (سطر لكل واحد)",
@@ -390,7 +338,6 @@ class DeleteModal(discord.ui.Modal, title="🗑️ حذف (اسم أو كود)")
         ok, bad = delete_many(str(self.data))
         load_cache()
         await interaction.response.send_message(f"🗑️ تم حذف: {ok}\n❌ لم يُعثر على: {bad}", ephemeral=True)
-
 
 class PanelView(discord.ui.View):
     def __init__(self):
@@ -430,7 +377,6 @@ class PanelView(discord.ui.View):
             await interaction.response.send_message("لا يوجد بيانات حاليًا.", ephemeral=True)
             return
 
-        # عرض أول 40 فقط داخل Embed
         lines = []
         ids_only = []
         for n, c, uid in records[:40]:
@@ -441,7 +387,6 @@ class PanelView(discord.ui.View):
         embed.add_field(name="كود | اسم | ID", value="```" + "\n".join(lines) + "```", inline=False)
         embed.add_field(name="IDs فقط للنسخ", value="```" + "\n".join(ids_only) + "```", inline=False)
         embed.set_footer(text=f"الإجمالي: {len(records)} | للتصدير الكامل اضغط 📤 تصدير TXT")
-
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
     @discord.ui.button(label="📤 تصدير TXT", style=discord.ButtonStyle.secondary, custom_id="panel:export")
@@ -455,7 +400,6 @@ class PanelView(discord.ui.View):
             await interaction.response.send_message("لا توجد بيانات للتصدير.", ephemeral=True)
             return
 
-        # TSV format (يفتح ممتاز في Excel/Sheets)
         lines = ["code\tname\tid"]
         for n, c, uid in records:
             lines.append(f"{c or ''}\t{n}\t{uid}")
@@ -539,6 +483,7 @@ async def slash_bulkadd(interaction: discord.Interaction, data: str):
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("❌ هذا الأمر للإدمن فقط.", ephemeral=True)
         return
+
     ok, bad, bad_lines = bulk_upsert(data)
     msg = f"✅ تمت إضافة/تحديث: {ok}\n❌ سجلات فشلت: {bad}"
     if bad_lines:
@@ -567,27 +512,11 @@ async def prefix_bulkadd(ctx, *, data: str):
     await ctx.send(f"✅ تمت إضافة/تحديث: {ok}\n❌ سجلات فشلت: {bad}")
 
 # =========================
-# Run (Anti 429 loop)
+# Run (simple + clear)
 # =========================
 token = os.getenv("TOKEN")
 if not token:
     raise RuntimeError("❌ TOKEN غير موجود في Render Environment Variables")
 
-async def main():
-    async with bot:
-        await bot.start(token, reconnect=True)
-
-while True:
-    try:
-        asyncio.run(main())
-    except discord.errors.HTTPException as e:
-        msg = str(e).lower()
-        if "429" in msg or "rate limited" in msg or "cloudflare" in msg:
-            print("⚠️ Discord/Cloudflare rate limited (429/1015). Sleeping 15 minutes to avoid restart loop...")
-            time.sleep(15 * 60)
-            continue
-        raise
-    except Exception as e:
-        print(f"❌ Unexpected error: {e}")
-        time.sleep(30)
-        continue
+print("STARTING DISCORD BOT... (if you don't see 'Logged in as', token/429 is the issue)")
+bot.run(token, reconnect=True)
