@@ -1,12 +1,16 @@
 import os
 import re
+import time
+import asyncio
 import sqlite3
+from io import BytesIO
+from threading import Thread
+
 import discord
 from discord.ext import commands
 from discord import app_commands
+
 from flask import Flask
-from threading import Thread
-from io import BytesIO
 
 # =========================
 # Keep Alive (Render)
@@ -18,7 +22,7 @@ def home():
     return "Bot is alive!"
 
 def run_web():
-    port = int(os.getenv("PORT", "8080"))
+    port = int(os.getenv("PORT", "10000"))
     app.run(host="0.0.0.0", port=port)
 
 Thread(target=run_web, daemon=True).start()
@@ -304,12 +308,11 @@ def parse_bulk_any(text: str):
         for line in lines:
             parts = line.split()
             if len(parts) < 3:
-                # تجاهل السطر الغير صالح بدون اعتباره خطأ
-                continue
+                continue  # تجاهل الغلط
             user_id = parts[0]
             code = parts[-1]
             name = " ".join(parts[1:-1])
-            entries.append((user_id, name, normalize_code(code), None))
+            entries.append((user_id, name, normalize_code(code)))
         return entries
 
     # single-line: split at each ID (15+ digits)
@@ -318,12 +321,11 @@ def parse_bulk_any(text: str):
     for seg in segments:
         parts = seg.split()
         if len(parts) < 3:
-            # تجاهل الجزء الغير صالح
             continue
         user_id = parts[0]
         code = parts[-1]
         name = " ".join(parts[1:-1])
-        entries.append((user_id, name, normalize_code(code), None))
+        entries.append((user_id, name, normalize_code(code)))
     return entries
 
 def bulk_upsert(text: str):
@@ -331,8 +333,7 @@ def bulk_upsert(text: str):
     ok, bad = 0, 0
     bad_lines = []
 
-    for user_id, name, code, errline in parsed:
-        # errline ما نستخدمه هنا لأننا نتجاهل الغلط من الأساس
+    for user_id, name, code in parsed:
         if not is_valid_id(user_id):
             bad += 1
             bad_lines.append(f"(ID غير صحيح) {user_id} | {name} | {code}")
@@ -363,9 +364,8 @@ def delete_many(keys_text: str):
 # =========================
 class AddModal(discord.ui.Modal, title="➕ إضافة (ID الاسم الكود)"):
     data = discord.ui.TextInput(
-        label="الصق البيانات (سطر لكل شخص)",
+        label="الصق البيانات (سطر لكل شخص) أو سطر واحد طويل",
         style=discord.TextStyle.long,
-        placeholder="مثال:\n729... جاسم السلمي c-61\n123... متعب العنزي c-51",
         required=True,
         max_length=4000
     )
@@ -382,7 +382,6 @@ class DeleteModal(discord.ui.Modal, title="🗑️ حذف (اسم أو كود)")
     data = discord.ui.TextInput(
         label="الصق الأسماء/الأكواد (سطر لكل واحد)",
         style=discord.TextStyle.long,
-        placeholder="مثال:\nc-61\nجاسم السلمي\nH-07",
         required=True,
         max_length=4000
     )
@@ -431,7 +430,7 @@ class PanelView(discord.ui.View):
             await interaction.response.send_message("لا يوجد بيانات حاليًا.", ephemeral=True)
             return
 
-        # عرض أول 40
+        # عرض أول 40 فقط داخل Embed
         lines = []
         ids_only = []
         for n, c, uid in records[:40]:
@@ -441,7 +440,7 @@ class PanelView(discord.ui.View):
         embed = discord.Embed(title="📋 قائمة البيانات (أول 40)")
         embed.add_field(name="كود | اسم | ID", value="```" + "\n".join(lines) + "```", inline=False)
         embed.add_field(name="IDs فقط للنسخ", value="```" + "\n".join(ids_only) + "```", inline=False)
-        embed.set_footer(text=f"الإجمالي: {len(records)} | للتصدير الكامل اضغط زر 📤 تصدير TXT")
+        embed.set_footer(text=f"الإجمالي: {len(records)} | للتصدير الكامل اضغط 📤 تصدير TXT")
 
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
@@ -456,7 +455,7 @@ class PanelView(discord.ui.View):
             await interaction.response.send_message("لا توجد بيانات للتصدير.", ephemeral=True)
             return
 
-        # TSV for easy Excel import
+        # TSV format (يفتح ممتاز في Excel/Sheets)
         lines = ["code\tname\tid"]
         for n, c, uid in records:
             lines.append(f"{c or ''}\t{n}\t{uid}")
@@ -505,7 +504,6 @@ async def panel_cmd(interaction: discord.Interaction):
         "\nملاحظة: الإضافة/الحذف للإدمن فقط."
     )
 
-    # update existing message if possible
     if PANEL_MESSAGE_ID:
         try:
             msg = await channel.fetch_message(PANEL_MESSAGE_ID)
@@ -535,18 +533,6 @@ async def slash_ids(interaction: discord.Interaction, query: str):
     embed.add_field(name="📋 IDs فقط للنسخ", value=ids_block, inline=False)
     await interaction.response.send_message(embed=embed, ephemeral=False)
 
-@bot.tree.command(name="add", description="إضافة شخص (ID + الاسم + الكود) - للإدمن فقط")
-@app_commands.describe(user_id="الآيدي", name="الاسم", code="الكود مثل c-61 أو H-07")
-async def slash_add(interaction: discord.Interaction, user_id: str, name: str, code: str):
-    if not interaction.user.guild_permissions.administrator:
-        await interaction.response.send_message("❌ هذا الأمر للإدمن فقط.", ephemeral=True)
-        return
-    if not is_valid_id(user_id):
-        await interaction.response.send_message("❌ الآيدي غير صحيح.", ephemeral=True)
-        return
-    rec = upsert_user(name, code, user_id)
-    await interaction.response.send_message(f"✅ تم: {rec[1]} | {rec[0]} | {rec[2]}", ephemeral=True)
-
 @bot.tree.command(name="bulkadd", description="إضافة/تحديث جماعي - للإدمن فقط")
 @app_commands.describe(data="الصق البيانات (حتى لو بسطر واحد): ID الاسم الكود ...")
 async def slash_bulkadd(interaction: discord.Interaction, data: str):
@@ -558,42 +544,6 @@ async def slash_bulkadd(interaction: discord.Interaction, data: str):
     if bad_lines:
         msg += "\n\nأول أخطاء:\n```" + "\n".join(bad_lines[:5]) + "```"
     await interaction.response.send_message(msg, ephemeral=True)
-
-@bot.tree.command(name="delete", description="حذف شخص واحد بالاسم أو الكود - للإدمن فقط")
-@app_commands.describe(key="اسم أو كود")
-async def slash_delete(interaction: discord.Interaction, key: str):
-    if not interaction.user.guild_permissions.administrator:
-        await interaction.response.send_message("❌ هذا الأمر للإدمن فقط.", ephemeral=True)
-        return
-    ok, row = delete_one_by_key(key)
-    if not ok:
-        await interaction.response.send_message("❌ ما لقيت سجل.", ephemeral=True)
-        return
-    await interaction.response.send_message(f"🗑️ تم الحذف: {row[1]} | {row[0]} | {row[2]}", ephemeral=True)
-
-@bot.tree.command(name="clear", description="حذف الكل - للإدمن فقط")
-async def slash_clear(interaction: discord.Interaction):
-    if not interaction.user.guild_permissions.administrator:
-        await interaction.response.send_message("❌ هذا الأمر للإدمن فقط.", ephemeral=True)
-        return
-    delete_all()
-    await interaction.response.send_message("🧹 تم حذف جميع السجلات.", ephemeral=True)
-
-@bot.tree.command(name="edit", description="تعديل شخص واحد - للإدمن فقط")
-@app_commands.describe(key="اسم أو كود", name="اسم جديد", code="كود جديد", user_id="ID جديد")
-async def slash_edit(interaction: discord.Interaction, key: str, name: str = None, code: str = None, user_id: str = None):
-    if not interaction.user.guild_permissions.administrator:
-        await interaction.response.send_message("❌ هذا الأمر للإدمن فقط.", ephemeral=True)
-        return
-    try:
-        ok, before, after = edit_one(key, name, code, user_id)
-    except ValueError as e:
-        await interaction.response.send_message(f"❌ {e}", ephemeral=True)
-        return
-    if not ok:
-        await interaction.response.send_message("❌ ما لقيت سجل.", ephemeral=True)
-        return
-    await interaction.response.send_message(f"✏️ قبل: {before}\n✅ بعد: {after}", ephemeral=True)
 
 # =========================
 # PREFIX COMMANDS (!)
@@ -610,68 +560,34 @@ async def prefix_ids(ctx, *, query: str):
     embed.add_field(name="📋 IDs فقط للنسخ", value=ids_block, inline=False)
     await ctx.send(embed=embed)
 
-@bot.command(name="add")
-@commands.has_permissions(administrator=True)
-async def prefix_add(ctx, user_id: str, code: str, *, name: str):
-    if not is_valid_id(user_id):
-        await ctx.send("❌ مثال صحيح: `!add 878... c-61 فهد الدوسري`")
-        return
-    rec = upsert_user(name, code, user_id)
-    await ctx.send(f"✅ تم: {rec[1]} | {rec[0]} | {rec[2]}")
-
 @bot.command(name="bulkadd")
 @commands.has_permissions(administrator=True)
 async def prefix_bulkadd(ctx, *, data: str):
     ok, bad, _ = bulk_upsert(data)
     await ctx.send(f"✅ تمت إضافة/تحديث: {ok}\n❌ سجلات فشلت: {bad}")
 
-@bot.command(name="delete")
-@commands.has_permissions(administrator=True)
-async def prefix_delete(ctx, *, key: str):
-    ok, row = delete_one_by_key(key)
-    if not ok:
-        await ctx.send("❌ ما لقيت سجل.")
-        return
-    await ctx.send(f"🗑️ تم الحذف: {row[1]} | {row[0]} | {row[2]}")
-
-@bot.command(name="clear")
-@commands.has_permissions(administrator=True)
-async def prefix_clear(ctx):
-    delete_all()
-    await ctx.send("🧹 تم حذف جميع السجلات.")
-
-@bot.command(name="edit")
-@commands.has_permissions(administrator=True)
-async def prefix_edit(ctx, key: str, field: str, *, value: str):
-    field = field.strip().lower()
-    name = code = user_id = None
-
-    if field in ["id", "user_id", "ايدي", "آيدي"]:
-        user_id = value
-    elif field in ["name", "اسم"]:
-        name = value
-    elif field in ["code", "كود"]:
-        code = value
-    else:
-        await ctx.send("❌ الحقل لازم يكون: name أو code أو id\nمثال: `!edit c-61 id 123...`")
-        return
-
-    try:
-        ok, before, after = edit_one(key, name, code, user_id)
-    except ValueError as e:
-        await ctx.send(f"❌ {e}")
-        return
-
-    if not ok:
-        await ctx.send("❌ ما لقيت سجل.")
-        return
-
-    await ctx.send(f"✏️ قبل: {before}\n✅ بعد: {after}")
-
 # =========================
-# Run
+# Run (Anti 429 loop)
 # =========================
 token = os.getenv("TOKEN")
 if not token:
     raise RuntimeError("❌ TOKEN غير موجود في Render Environment Variables")
-bot.run(token)
+
+async def main():
+    async with bot:
+        await bot.start(token, reconnect=True)
+
+while True:
+    try:
+        asyncio.run(main())
+    except discord.errors.HTTPException as e:
+        msg = str(e).lower()
+        if "429" in msg or "rate limited" in msg or "cloudflare" in msg:
+            print("⚠️ Discord/Cloudflare rate limited (429/1015). Sleeping 15 minutes to avoid restart loop...")
+            time.sleep(15 * 60)
+            continue
+        raise
+    except Exception as e:
+        print(f"❌ Unexpected error: {e}")
+        time.sleep(30)
+        continue
