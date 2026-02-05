@@ -6,6 +6,7 @@ from discord.ext import commands
 from discord import app_commands
 from flask import Flask
 from threading import Thread
+from io import BytesIO
 
 # =========================
 # Keep Alive (Render)
@@ -26,11 +27,14 @@ Thread(target=run_web, daemon=True).start()
 # Discord Bot
 # =========================
 intents = discord.Intents.default()
-intents.message_content = True  # لازم لأوامر !
+intents.message_content = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 DB_PATH = "data.db"
+
+PANEL_CHANNEL_ID = int(os.getenv("PANEL_CHANNEL_ID", "0") or "0")
+PANEL_MESSAGE_ID = int(os.getenv("PANEL_MESSAGE_ID", "0") or "0")
 
 # caches:
 # normalized_name -> (name, code, user_id)
@@ -45,9 +49,7 @@ def normalize_name(name: str) -> str:
     return str(name).replace("_", " ").replace("-", " ").strip().lower()
 
 def normalize_code(code: str) -> str:
-    # "c -48" -> "c-48"
-    s = str(code).strip().lower().replace(" ", "")
-    return s
+    return str(code).strip().lower().replace(" ", "")
 
 def is_valid_id(user_id: str) -> bool:
     user_id = str(user_id).strip()
@@ -67,14 +69,6 @@ def get_table_columns(conn, table: str):
     return [row[1] for row in c.fetchall()]
 
 def init_db():
-    """
-    جدول users:
-    users(
-      name TEXT PRIMARY KEY,   -- نخزنه normalized
-      code TEXT UNIQUE,
-      user_id TEXT NOT NULL
-    )
-    """
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
 
@@ -92,7 +86,6 @@ def init_db():
 
     cols = get_table_columns(conn, "users")
     if "code" not in cols:
-        # migrate old users(name,user_id) -> new with code NULL
         c.execute("""
             CREATE TABLE IF NOT EXISTS users_new (
                 name TEXT PRIMARY KEY,
@@ -130,12 +123,11 @@ def load_cache():
 
     for name, code, user_id in rows:
         nn = normalize_name(name)
-        code_clean = normalize_code(code) if code is not None else None
-        record = (nn, code_clean, str(user_id))
-
-        cache_name[nn] = record
-        if code_clean:
-            cache_code[code_clean] = record
+        cc = normalize_code(code) if code is not None else None
+        rec = (nn, cc, str(user_id))
+        cache_name[nn] = rec
+        if cc:
+            cache_code[cc] = rec
 
     print(f"✅ Loaded {len(cache_name)} names and {len(cache_code)} codes into cache")
 
@@ -161,10 +153,6 @@ def upsert_user(name: str, code: str, user_id: str):
     return rec
 
 def find_row_by_key(key: str):
-    """
-    key: اسم أو كود
-    يرجع (name, code, user_id) أو None
-    """
     nn = normalize_name(key)
     cc = normalize_code(key)
 
@@ -180,6 +168,7 @@ def find_row_by_key(key: str):
     conn.close()
     if not row:
         return None
+
     name_db, code_db, uid_db = row
     return (normalize_name(name_db), normalize_code(code_db) if code_db else None, str(uid_db))
 
@@ -210,10 +199,6 @@ def delete_all():
     load_cache()
 
 def edit_one(key: str, new_name=None, new_code=None, new_user_id=None):
-    """
-    يعدّل سجل واحد بالاسم أو الكود.
-    أي قيمة None = لا تغيّر.
-    """
     row = find_row_by_key(key)
     if not row:
         return False, None, None
@@ -244,23 +229,15 @@ def edit_one(key: str, new_name=None, new_code=None, new_user_id=None):
     return True, before, after
 
 # =========================
-# Lookup + nice output
+# Lookup + formatting
 # =========================
 def split_query_items(query: str):
-    """
-    يدعم:
-    - متعدد العناصر (مسافات/فواصل)
-    - اسم كامل بجملة
-    """
     q = str(query).strip()
     items = []
     if not q:
         return items
 
-    # 1) كامل كاسم (حتى لو فيه مسافات)
-    items.append(q)
-
-    # 2) تفكيك حسب الفواصل/المسافات
+    items.append(q)  # full phrase
     raw = q.replace(",", " ")
     for p in raw.split():
         if p.strip():
@@ -268,10 +245,6 @@ def split_query_items(query: str):
     return items
 
 def lookup_records(query: str):
-    """
-    يرجع قائمة Records: (name, code, user_id)
-    بالبحث عن الاسم أو الكود، ويدعم أكثر من عنصر.
-    """
     found = []
     seen_ids = set()
 
@@ -286,54 +259,52 @@ def lookup_records(query: str):
             rec = cache_code[cc]
 
         if rec:
-            name_db, code_db, uid_db = rec
-            if uid_db not in seen_ids:
+            n, c, uid = rec
+            if uid not in seen_ids:
                 found.append(rec)
-                seen_ids.add(uid_db)
+                seen_ids.add(uid)
 
     return found
 
 def format_results(records):
-    """
-    يعطي:
-    1) نص مرتب: code | name | id
-    2) ids فقط
-    """
     lines = []
     ids_only = []
-    for name_db, code_db, uid_db in records:
-        code_show = code_db if code_db else "-"
-        name_show = name_db  # الاسم عندنا normalized (عربي ما يتأثر)
-        lines.append(f"{code_show} | {name_show} | {uid_db}")
-        ids_only.append(uid_db)
+    for n, c, uid in records:
+        lines.append(f"{c or '-'} | {n} | {uid}")
+        ids_only.append(uid)
 
     pretty = "```" + "\n".join(lines) + "```" if lines else "```-```"
     ids_block = "```" + "\n".join(ids_only) + "```" if ids_only else "```-```"
     return pretty, ids_block
 
+def list_all_records():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT name, code, user_id FROM users ORDER BY code IS NULL, code, name")
+    rows = c.fetchall()
+    conn.close()
+
+    out = []
+    for n, code, uid in rows:
+        out.append((normalize_name(n), normalize_code(code) if code else None, str(uid)))
+    return out
+
 # =========================
-# Bulk parsing (works for multiline AND single-line)
+# Bulk parsing (multiline OR single-line)
 # =========================
 def parse_bulk_any(text: str):
-    """
-    يدعم:
-    - متعدد أسطر: ID  الاسم  الكود
-    - سطر واحد طويل (سلاش): ID الاسم الكود ID الاسم الكود ...
-    يعتمد على اكتشاف IDs (15+ رقم) كبداية لكل سجل.
-    """
     raw = str(text).strip()
     if not raw:
         return []
 
-    # إذا فيه أسطر، عالج كسطور
+    # multiline
     if "\n" in raw:
         lines = [l.strip() for l in raw.splitlines() if l.strip()]
         entries = []
         for line in lines:
-            # أسهل: أول رقم = ID، آخر كلمة = code، الوسط = الاسم
             parts = line.split()
             if len(parts) < 3:
-                entries.append((None, None, None, line))
+                # تجاهل السطر الغير صالح بدون اعتباره خطأ
                 continue
             user_id = parts[0]
             code = parts[-1]
@@ -341,14 +312,13 @@ def parse_bulk_any(text: str):
             entries.append((user_id, name, normalize_code(code), None))
         return entries
 
-    # سطر واحد: قسمه عند كل ID
-    # يعيد قائمة segments، كل segment يبدأ بـ ID
+    # single-line: split at each ID (15+ digits)
     segments = [s.strip() for s in re.split(r'(?=\d{15,})', raw) if s.strip()]
     entries = []
     for seg in segments:
         parts = seg.split()
         if len(parts) < 3:
-            entries.append((None, None, None, seg))
+            # تجاهل الجزء الغير صالح
             continue
         user_id = parts[0]
         code = parts[-1]
@@ -362,10 +332,7 @@ def bulk_upsert(text: str):
     bad_lines = []
 
     for user_id, name, code, errline in parsed:
-        if errline is not None:
-            bad += 1
-            bad_lines.append(errline)
-            continue
+        # errline ما نستخدمه هنا لأننا نتجاهل الغلط من الأساس
         if not is_valid_id(user_id):
             bad += 1
             bad_lines.append(f"(ID غير صحيح) {user_id} | {name} | {code}")
@@ -380,6 +347,124 @@ def bulk_upsert(text: str):
 
     return ok, bad, bad_lines
 
+def delete_many(keys_text: str):
+    lines = [l.strip() for l in str(keys_text).splitlines() if l.strip()]
+    ok, bad = 0, 0
+    for key in lines:
+        deleted, _ = delete_one_by_key(key)
+        if deleted:
+            ok += 1
+        else:
+            bad += 1
+    return ok, bad
+
+# =========================
+# Panel UI (Buttons + Modals)
+# =========================
+class AddModal(discord.ui.Modal, title="➕ إضافة (ID الاسم الكود)"):
+    data = discord.ui.TextInput(
+        label="الصق البيانات (سطر لكل شخص)",
+        style=discord.TextStyle.long,
+        placeholder="مثال:\n729... جاسم السلمي c-61\n123... متعب العنزي c-51",
+        required=True,
+        max_length=4000
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        ok, bad, bad_lines = bulk_upsert(str(self.data))
+        msg = f"✅ تمت إضافة/تحديث: {ok}\n❌ سجلات فشلت: {bad}"
+        if bad_lines:
+            msg += "\n\nأول أخطاء:\n```" + "\n".join(bad_lines[:5]) + "```"
+        await interaction.response.send_message(msg, ephemeral=True)
+
+
+class DeleteModal(discord.ui.Modal, title="🗑️ حذف (اسم أو كود)"):
+    data = discord.ui.TextInput(
+        label="الصق الأسماء/الأكواد (سطر لكل واحد)",
+        style=discord.TextStyle.long,
+        placeholder="مثال:\nc-61\nجاسم السلمي\nH-07",
+        required=True,
+        max_length=4000
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        ok, bad = delete_many(str(self.data))
+        load_cache()
+        await interaction.response.send_message(f"🗑️ تم حذف: {ok}\n❌ لم يُعثر على: {bad}", ephemeral=True)
+
+
+class PanelView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    def _check_channel(self, interaction: discord.Interaction) -> bool:
+        return (not PANEL_CHANNEL_ID) or (interaction.channel_id == PANEL_CHANNEL_ID)
+
+    @discord.ui.button(label="➕ إضافة (مجموعة/اسم)", style=discord.ButtonStyle.success, custom_id="panel:add")
+    async def add_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not self._check_channel(interaction):
+            await interaction.response.send_message("❌ استخدم اللوحة في الروم المخصص فقط.", ephemeral=True)
+            return
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message("❌ هذا الخيار للإدمن فقط.", ephemeral=True)
+            return
+        await interaction.response.send_modal(AddModal())
+
+    @discord.ui.button(label="🗑️ حذف (مجموعة/اسم)", style=discord.ButtonStyle.danger, custom_id="panel:delete")
+    async def delete_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not self._check_channel(interaction):
+            await interaction.response.send_message("❌ استخدم اللوحة في الروم المخصص فقط.", ephemeral=True)
+            return
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message("❌ هذا الخيار للإدمن فقط.", ephemeral=True)
+            return
+        await interaction.response.send_modal(DeleteModal())
+
+    @discord.ui.button(label="📋 عرض الأسماء", style=discord.ButtonStyle.primary, custom_id="panel:list")
+    async def list_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not self._check_channel(interaction):
+            await interaction.response.send_message("❌ استخدم اللوحة في الروم المخصص فقط.", ephemeral=True)
+            return
+
+        records = list_all_records()
+        if not records:
+            await interaction.response.send_message("لا يوجد بيانات حاليًا.", ephemeral=True)
+            return
+
+        # عرض أول 40
+        lines = []
+        ids_only = []
+        for n, c, uid in records[:40]:
+            lines.append(f"{c or '-'} | {n} | {uid}")
+            ids_only.append(uid)
+
+        embed = discord.Embed(title="📋 قائمة البيانات (أول 40)")
+        embed.add_field(name="كود | اسم | ID", value="```" + "\n".join(lines) + "```", inline=False)
+        embed.add_field(name="IDs فقط للنسخ", value="```" + "\n".join(ids_only) + "```", inline=False)
+        embed.set_footer(text=f"الإجمالي: {len(records)} | للتصدير الكامل اضغط زر 📤 تصدير TXT")
+
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @discord.ui.button(label="📤 تصدير TXT", style=discord.ButtonStyle.secondary, custom_id="panel:export")
+    async def export_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not self._check_channel(interaction):
+            await interaction.response.send_message("❌ استخدم اللوحة في الروم المخصص فقط.", ephemeral=True)
+            return
+
+        records = list_all_records()
+        if not records:
+            await interaction.response.send_message("لا توجد بيانات للتصدير.", ephemeral=True)
+            return
+
+        # TSV for easy Excel import
+        lines = ["code\tname\tid"]
+        for n, c, uid in records:
+            lines.append(f"{c or ''}\t{n}\t{uid}")
+        content = "\n".join(lines)
+
+        file = discord.File(fp=BytesIO(content.encode("utf-8")), filename="ids.txt")
+        await interaction.response.send_message("📄 تم إنشاء ملف التصدير:", file=file, ephemeral=True)
+
 # =========================
 # Events
 # =========================
@@ -387,31 +472,67 @@ def bulk_upsert(text: str):
 async def on_ready():
     init_db()
     load_cache()
+    bot.add_view(PanelView())  # keep buttons alive after restart
     await bot.tree.sync()
-    await bot.change_presence(activity=discord.Game(name="/ids | /bulkadd | /delete | /clear | /edit"))
-    print(f"🤖 Logged in as {bot.user} | Slash commands synced")
+    await bot.change_presence(activity=discord.Game(name="لوحة IDs | /panel"))
+    print(f"🤖 Logged in as {bot.user}")
 
 # =========================
 # SLASH COMMANDS
 # =========================
+@bot.tree.command(name="panel", description="إنشاء/تحديث لوحة التحكم في الروم المحدد (إدمن فقط)")
+async def panel_cmd(interaction: discord.Interaction):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ هذا الأمر للإدمن فقط.", ephemeral=True)
+        return
+
+    if not PANEL_CHANNEL_ID:
+        await interaction.response.send_message("❌ PANEL_CHANNEL_ID غير مضبوط في Render.", ephemeral=True)
+        return
+
+    channel = interaction.guild.get_channel(PANEL_CHANNEL_ID)
+    if not channel:
+        await interaction.response.send_message("❌ ما قدرت أوصل للروم. تأكد من Channel ID وصلاحيات البوت.", ephemeral=True)
+        return
+
+    view = PanelView()
+    content = (
+        "📌 **لوحة إدارة الـ IDs**\n"
+        "➕ إضافة (اسم/مجموعة)\n"
+        "🗑️ حذف (اسم/مجموعة)\n"
+        "📋 عرض القائمة\n"
+        "📤 تصدير TXT\n"
+        "\nملاحظة: الإضافة/الحذف للإدمن فقط."
+    )
+
+    # update existing message if possible
+    if PANEL_MESSAGE_ID:
+        try:
+            msg = await channel.fetch_message(PANEL_MESSAGE_ID)
+            await msg.edit(content=content, view=view)
+            await interaction.response.send_message("✅ تم تحديث اللوحة.", ephemeral=True)
+            return
+        except Exception:
+            pass
+
+    msg = await channel.send(content, view=view)
+    await interaction.response.send_message(
+        f"✅ تم إنشاء اللوحة.\nانسخ Message ID هذا وضعه في Render كـ PANEL_MESSAGE_ID:\n`{msg.id}`",
+        ephemeral=True
+    )
+
 @bot.tree.command(name="ids", description="بحث ID بالاسم أو الكود (يدعم أكثر من عنصر)")
-@app_commands.describe(query="اكتب اسم/كود أو أكثر (مثال: جاسم السلمي c-61 H-07)")
+@app_commands.describe(query="مثال: فهد الدوسري c-61 H-07")
 async def slash_ids(interaction: discord.Interaction, query: str):
     records = lookup_records(query)
     if not records:
-        embed = discord.Embed(
-            title="❌ ما لقيت نتائج",
-            description="اكتب الاسم أو الكود.\nيدعم: مسافات / , / _ / - / C أو c"
-        )
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        await interaction.response.send_message("❌ ما لقيت نتائج.", ephemeral=True)
         return
 
     pretty, ids_block = format_results(records)
-
     embed = discord.Embed(title="✅ النتائج (كود | اسم | ID)")
     embed.add_field(name=f"📌 العدد: {len(records)}", value=pretty, inline=False)
     embed.add_field(name="📋 IDs فقط للنسخ", value=ids_block, inline=False)
-    embed.set_footer(text=f"طلب بواسطة: {interaction.user}")
     await interaction.response.send_message(embed=embed, ephemeral=False)
 
 @bot.tree.command(name="add", description="إضافة شخص (ID + الاسم + الكود) - للإدمن فقط")
@@ -420,79 +541,46 @@ async def slash_add(interaction: discord.Interaction, user_id: str, name: str, c
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("❌ هذا الأمر للإدمن فقط.", ephemeral=True)
         return
-
     if not is_valid_id(user_id):
-        await interaction.response.send_message("❌ الآيدي غير صحيح (أرقام فقط).", ephemeral=True)
+        await interaction.response.send_message("❌ الآيدي غير صحيح.", ephemeral=True)
         return
-
     rec = upsert_user(name, code, user_id)
-    n, c, uid = rec
-    embed = discord.Embed(title="✅ تمّت الإضافة/التحديث")
-    embed.add_field(name="الاسم", value=n, inline=False)
-    embed.add_field(name="الكود", value=c, inline=False)
-    embed.add_field(name="ID", value=f"`{uid}`", inline=False)
-    await interaction.response.send_message(embed=embed, ephemeral=True)
+    await interaction.response.send_message(f"✅ تم: {rec[1]} | {rec[0]} | {rec[2]}", ephemeral=True)
 
-@bot.tree.command(name="bulkadd", description="إضافة/تحديث الكل (جدول كامل) - للإدمن فقط")
-@app_commands.describe(data="الصق البيانات (حتى لو بسطر واحد): ID الاسم الكود ID الاسم الكود ...")
+@bot.tree.command(name="bulkadd", description="إضافة/تحديث جماعي - للإدمن فقط")
+@app_commands.describe(data="الصق البيانات (حتى لو بسطر واحد): ID الاسم الكود ...")
 async def slash_bulkadd(interaction: discord.Interaction, data: str):
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("❌ هذا الأمر للإدمن فقط.", ephemeral=True)
         return
-
     ok, bad, bad_lines = bulk_upsert(data)
-    msg = f"✅ تمت إضافة/تحديث: {ok}\n❌ أسطر/سجلات فشلت: {bad}"
-    if bad_lines:
-        msg += "\n\nأول أخطاء:\n```" + "\n".join(bad_lines[:5]) + "```"
-    await interaction.response.send_message(msg, ephemeral=True)
-
-@bot.tree.command(name="bulkedit", description="تعديل/تحديث الكل دفعة وحدة (نفس bulkadd) - للإدمن فقط")
-@app_commands.describe(data="الصق البيانات (حتى لو بسطر واحد): ID الاسم الكود ...")
-async def slash_bulkedit(interaction: discord.Interaction, data: str):
-    if not interaction.user.guild_permissions.administrator:
-        await interaction.response.send_message("❌ هذا الأمر للإدمن فقط.", ephemeral=True)
-        return
-
-    ok, bad, bad_lines = bulk_upsert(data)
-    msg = f"✅ تم تعديل/تحديث: {ok}\n❌ سجلات فشلت: {bad}"
+    msg = f"✅ تمت إضافة/تحديث: {ok}\n❌ سجلات فشلت: {bad}"
     if bad_lines:
         msg += "\n\nأول أخطاء:\n```" + "\n".join(bad_lines[:5]) + "```"
     await interaction.response.send_message(msg, ephemeral=True)
 
 @bot.tree.command(name="delete", description="حذف شخص واحد بالاسم أو الكود - للإدمن فقط")
-@app_commands.describe(key="اسم أو كود (مثال: c-61 أو جاسم السلمي)")
+@app_commands.describe(key="اسم أو كود")
 async def slash_delete(interaction: discord.Interaction, key: str):
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("❌ هذا الأمر للإدمن فقط.", ephemeral=True)
         return
-
     ok, row = delete_one_by_key(key)
     if not ok:
-        await interaction.response.send_message("❌ ما لقيت سجل بهذا الاسم/الكود.", ephemeral=True)
+        await interaction.response.send_message("❌ ما لقيت سجل.", ephemeral=True)
         return
+    await interaction.response.send_message(f"🗑️ تم الحذف: {row[1]} | {row[0]} | {row[2]}", ephemeral=True)
 
-    name_db, code_db, uid_db = row
-    embed = discord.Embed(title="🗑️ تم الحذف")
-    embed.add_field(name="الاسم", value=str(name_db), inline=False)
-    embed.add_field(name="الكود", value=str(code_db), inline=False)
-    embed.add_field(name="ID", value=f"`{uid_db}`", inline=False)
-    await interaction.response.send_message(embed=embed, ephemeral=True)
-
-@bot.tree.command(name="clear", description="حذف الكل (يمسح جميع البيانات) - للإدمن فقط")
+@bot.tree.command(name="clear", description="حذف الكل - للإدمن فقط")
 async def slash_clear(interaction: discord.Interaction):
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("❌ هذا الأمر للإدمن فقط.", ephemeral=True)
         return
     delete_all()
-    await interaction.response.send_message("🧹 تم حذف جميع السجلات (الكل).", ephemeral=True)
+    await interaction.response.send_message("🧹 تم حذف جميع السجلات.", ephemeral=True)
 
-@bot.tree.command(name="edit", description="تعديل شخص واحد (بالاسم أو الكود) - للإدمن فقط")
-@app_commands.describe(
-    key="اسم أو كود الشخص الحالي",
-    name="اسم جديد (اختياري)",
-    code="كود جديد (اختياري)",
-    user_id="ID جديد (اختياري)"
-)
+@bot.tree.command(name="edit", description="تعديل شخص واحد - للإدمن فقط")
+@app_commands.describe(key="اسم أو كود", name="اسم جديد", code="كود جديد", user_id="ID جديد")
 async def slash_edit(interaction: discord.Interaction, key: str, name: str = None, code: str = None, user_id: str = None):
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("❌ هذا الأمر للإدمن فقط.", ephemeral=True)
@@ -502,25 +590,10 @@ async def slash_edit(interaction: discord.Interaction, key: str, name: str = Non
     except ValueError as e:
         await interaction.response.send_message(f"❌ {e}", ephemeral=True)
         return
-
     if not ok:
-        await interaction.response.send_message("❌ ما لقيت سجل بهذا الاسم/الكود.", ephemeral=True)
+        await interaction.response.send_message("❌ ما لقيت سجل.", ephemeral=True)
         return
-
-    b = before
-    a = after
-    embed = discord.Embed(title="✏️ تم التعديل")
-    embed.add_field(name="قبل", value=f"{b[1]} | {b[0]} | {b[2]}", inline=False)
-    embed.add_field(name="بعد", value=f"{a[1]} | {a[0]} | {a[2]}", inline=False)
-    await interaction.response.send_message(embed=embed, ephemeral=True)
-
-@bot.tree.command(name="reload", description="تحديث الكاش من قاعدة البيانات - للإدمن فقط")
-async def slash_reload(interaction: discord.Interaction):
-    if not interaction.user.guild_permissions.administrator:
-        await interaction.response.send_message("❌ هذا الأمر للإدمن فقط.", ephemeral=True)
-        return
-    load_cache()
-    await interaction.response.send_message("✅ تم تحديث الكاش.", ephemeral=True)
+    await interaction.response.send_message(f"✏️ قبل: {before}\n✅ بعد: {after}", ephemeral=True)
 
 # =========================
 # PREFIX COMMANDS (!)
@@ -529,45 +602,35 @@ async def slash_reload(interaction: discord.Interaction):
 async def prefix_ids(ctx, *, query: str):
     records = lookup_records(query)
     if not records:
-        await ctx.send("❌ لم يتم العثور على نتائج (ابحث بالاسم أو الكود)")
+        await ctx.send("❌ ما لقيت نتائج.")
         return
-
     pretty, ids_block = format_results(records)
-
     embed = discord.Embed(title="✅ النتائج (كود | اسم | ID)")
     embed.add_field(name=f"📌 العدد: {len(records)}", value=pretty, inline=False)
     embed.add_field(name="📋 IDs فقط للنسخ", value=ids_block, inline=False)
-    embed.set_footer(text=f"طلب بواسطة: {ctx.author}")
     await ctx.send(embed=embed)
 
 @bot.command(name="add")
 @commands.has_permissions(administrator=True)
 async def prefix_add(ctx, user_id: str, code: str, *, name: str):
-    # صيغة: !add 878... c-61 فهد الدوسري
     if not is_valid_id(user_id):
-        await ctx.send("❌ صيغة خاطئة.\nمثال: `!add 878450962879098880 c-61 فهد الدوسري`")
+        await ctx.send("❌ مثال صحيح: `!add 878... c-61 فهد الدوسري`")
         return
     rec = upsert_user(name, code, user_id)
-    await ctx.send(f"✅ تم إضافة/تحديث: **{rec[0]}** | `{rec[1]}` | `{rec[2]}`")
+    await ctx.send(f"✅ تم: {rec[1]} | {rec[0]} | {rec[2]}")
 
 @bot.command(name="bulkadd")
 @commands.has_permissions(administrator=True)
 async def prefix_bulkadd(ctx, *, data: str):
     ok, bad, _ = bulk_upsert(data)
-    await ctx.send(f"✅ تمت إضافة/تحديث: {ok}\n❌ أسطر/سجلات فشلت: {bad}")
-
-@bot.command(name="bulkedit")
-@commands.has_permissions(administrator=True)
-async def prefix_bulkedit(ctx, *, data: str):
-    ok, bad, _ = bulk_upsert(data)
-    await ctx.send(f"✅ تم تعديل/تحديث: {ok}\n❌ أسطر/سجلات فشلت: {bad}")
+    await ctx.send(f"✅ تمت إضافة/تحديث: {ok}\n❌ سجلات فشلت: {bad}")
 
 @bot.command(name="delete")
 @commands.has_permissions(administrator=True)
 async def prefix_delete(ctx, *, key: str):
     ok, row = delete_one_by_key(key)
     if not ok:
-        await ctx.send("❌ ما لقيت سجل بهذا الاسم/الكود.")
+        await ctx.send("❌ ما لقيت سجل.")
         return
     await ctx.send(f"🗑️ تم الحذف: {row[1]} | {row[0]} | {row[2]}")
 
@@ -575,16 +638,11 @@ async def prefix_delete(ctx, *, key: str):
 @commands.has_permissions(administrator=True)
 async def prefix_clear(ctx):
     delete_all()
-    await ctx.send("🧹 تم حذف جميع السجلات (الكل).")
+    await ctx.send("🧹 تم حذف جميع السجلات.")
 
 @bot.command(name="edit")
 @commands.has_permissions(administrator=True)
 async def prefix_edit(ctx, key: str, field: str, *, value: str):
-    """
-    !edit c-61 id 123...
-    !edit c-61 name فهد الدوسري
-    !edit c-61 code c-70
-    """
     field = field.strip().lower()
     name = code = user_id = None
 
@@ -605,10 +663,10 @@ async def prefix_edit(ctx, key: str, field: str, *, value: str):
         return
 
     if not ok:
-        await ctx.send("❌ ما لقيت سجل بهذا الاسم/الكود.")
+        await ctx.send("❌ ما لقيت سجل.")
         return
 
-    await ctx.send(f"✏️ تم التعديل:\nقبل: {before}\nبعد: {after}")
+    await ctx.send(f"✏️ قبل: {before}\n✅ بعد: {after}")
 
 # =========================
 # Run
